@@ -1,8 +1,8 @@
 //+------------------------------------------------------------------+
 //|                                            XAUUSD_Scalper.mq5   |
-//|                     XAUUSD Advanced Scalping EA  v5              |
+//|                     XAUUSD Advanced Scalping EA  v5.1            |
 //|                                                                  |
-//|  Strategy (4-layer confirmation):                                |
+//|  Strategy (3-layer confirmation):                                |
 //|   1. H4 TREND   — EMA(50) on H4 defines macro direction.        |
 //|                   Only BUY when M5 price > H4 EMA(50).          |
 //|                   Only SELL when M5 price < H4 EMA(50).         |
@@ -11,19 +11,17 @@
 //|   2. M5 SIGNAL  — EMA(10) crosses EMA(30) in trend direction.   |
 //|                   One crossover = one entry attempt.             |
 //|                                                                  |
-//|   3. RSI FILTER — RSI(14) must confirm direction.                |
-//|                   Buy: RSI between 50-70 (momentum up, not OB)  |
-//|                   Sell: RSI between 30-50 (momentum down, not OS)|
-//|                                                                  |
-//|   4. SESSION    — Only trade during active market hours (GMT).   |
-//|                   Gold moves predictably during London/NY.       |
+//|   3. RSI GUARD  — RSI(14) filters out extreme conditions only.  |
+//|                   Buy:  RSI < 75 (not severely overbought)       |
+//|                   Sell: RSI > 25 (not severely oversold)         |
+//|                   Journal logs every rejected signal with reason. |
 //|                                                                  |
 //|  Exits: USD profit target + USD stop loss (monitored per tick).  |
 //|  Breakeven: SL moves to entry once trade is in profit by X USD. |
 //+------------------------------------------------------------------+
 #property copyright "Custom EA"
 #property link      ""
-#property version   "5.00"
+#property version   "5.10"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -39,17 +37,15 @@ input group "=== H4 Trend Filter ==="
 input ENUM_TIMEFRAMES HTF_Period   = PERIOD_H4; // Higher timeframe for trend
 input int    HTF_EMA_Period        = 50;         // EMA period on H4
 
-input group "=== RSI Momentum Filter ==="
+input group "=== RSI Guard (extremes only) ==="
 input int    RSI_Period         = 14;   // RSI period (M5)
-input double RSI_BuyMin         = 50.0; // RSI must be ABOVE this for buys (momentum bullish)
-input double RSI_BuyMax         = 70.0; // RSI must be BELOW this for buys (not overbought)
-input double RSI_SellMax        = 50.0; // RSI must be BELOW this for sells (momentum bearish)
-input double RSI_SellMin        = 30.0; // RSI must be ABOVE this for sells (not oversold)
+input double RSI_BuyMax         = 75.0; // Block buys if RSI is ABOVE this (severely overbought)
+input double RSI_SellMin        = 25.0; // Block sells if RSI is BELOW this (severely oversold)
 
 input group "=== Session Filter (GMT hours) ==="
-input bool   UseSessionFilter   = true; // Only trade during configured hours
-input int    SessionStartHour   = 7;    // Session open hour (GMT) — London opens at 07:00
-input int    SessionEndHour     = 22;   // Session close hour (GMT) — NY closes at 22:00
+input bool   UseSessionFilter   = false; // Disable to test all hours — enable for live trading
+input int    SessionStartHour   = 7;     // Session open hour (GMT)
+input int    SessionEndHour     = 22;    // Session close hour (GMT)
 
 input group "=== Trade Settings ==="
 input double LotSize            = 0.01; // Trade volume in lots
@@ -100,10 +96,11 @@ int OnInit()
    if(handleRSI     == INVALID_HANDLE) { Print("ERROR: RSI failed. Code:",      GetLastError()); return INIT_FAILED; }
    if(handleATR     == INVALID_HANDLE) { Print("ERROR: ATR failed. Code:",      GetLastError()); return INIT_FAILED; }
 
-   Print("=== XAUUSD Scalper v5 Started ===");
+   Print("=== XAUUSD Scalper v5.1 Started ===");
    Print("M5 EMA: ", EMA_Fast_Period, "/", EMA_Slow_Period,
          " | HTF: ", EnumToString(HTF_Period), " EMA(", HTF_EMA_Period, ")",
-         " | RSI: ", RSI_Period,
+         " | RSI guard: buy<", RSI_BuyMax, " sell>", RSI_SellMin,
+         " | Session: ", UseSessionFilter ? "ON" : "OFF",
          " | TP: $", TargetProfitUSD, " SL: $", StopLossUSD, " BE: $", BreakevenUSD);
 
    return INIT_SUCCEEDED;
@@ -331,17 +328,31 @@ void OnTick()
    bool   htfBearish = (currentBid < htfEMA); // Price below H4 EMA → macro downtrend
 
    // ================================================================
-   // Read RSI (momentum confirmation)
-   // RSI must confirm the direction of the crossover:
-   //   Buy:  RSI 50-70 = bullish momentum, not yet overbought
-   //   Sell: RSI 30-50 = bearish momentum, not yet oversold
+   // Read RSI — only used to block extreme overbought/oversold entries
    // ================================================================
    double rsiBuf[1];
    if(CopyBuffer(handleRSI, 0, 1, 1, rsiBuf) < 1) return;
    double rsi = rsiBuf[0];
 
-   bool rsiOkBuy  = (rsi >= RSI_BuyMin  && rsi <= RSI_BuyMax);
-   bool rsiOkSell = (rsi <= RSI_SellMax && rsi >= RSI_SellMin);
+   bool rsiOkBuy  = (rsi <= RSI_BuyMax);  // RSI < 75: not severely overbought
+   bool rsiOkSell = (rsi >= RSI_SellMin); // RSI > 25: not severely oversold
+
+   // ================================================================
+   // Diagnostic log — fires on EVERY crossover so Journal shows exactly
+   // which filter is rejecting signals. Check the Journal tab if 0 trades.
+   // ================================================================
+   string direction = bullishCross ? "BULLISH" : "BEARISH";
+   string h4Status  = bullishCross
+                      ? (htfBullish ? "OK(price>H4)" : "BLOCKED(price<H4)")
+                      : (htfBearish ? "OK(price<H4)" : "BLOCKED(price>H4)");
+   string rsiStatus = bullishCross
+                      ? (rsiOkBuy  ? "OK" : StringFormat("BLOCKED(RSI=%.1f>%.0f)", rsi, RSI_BuyMax))
+                      : (rsiOkSell ? "OK" : StringFormat("BLOCKED(RSI=%.1f<%.0f)", rsi, RSI_SellMin));
+
+   Print(direction, " CROSS | H4=", h4Status, " RSI=", rsiStatus,
+         " | FastEMA=", DoubleToString(fastNow, 2),
+         " SlowEMA=",   DoubleToString(slowNow, 2),
+         " | H4EMA=",   DoubleToString(htfEMA, 2));
 
    // ================================================================
    // Calculate SL/TP price levels from USD amounts
@@ -354,7 +365,7 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    // ================================================================
-   // BUY: crossover + H4 uptrend + RSI momentum confirmed
+   // BUY: bullish crossover + H4 uptrend + RSI not overbought
    // ================================================================
    if(bullishCross && htfBullish && rsiOkBuy &&
       CountPositions(POSITION_TYPE_BUY) < MaxPositions)
@@ -362,18 +373,15 @@ void OnTick()
       double slPrice = NormalizeDouble(ask - slDist, _Digits);
       double tpPrice = NormalizeDouble(ask + tpDist, _Digits);
 
-      Print("BUY | H4EMA=", DoubleToString(htfEMA, 2),
-            " Price>H4=YES | RSI=", DoubleToString(rsi, 1),
-            " | FastEMA=", DoubleToString(fastNow, 2),
-            " SlowEMA=", DoubleToString(slowNow, 2),
-            " | SL=$", StopLossUSD, " TP=$", TargetProfitUSD);
+      Print(">>> OPENING BUY | SL=$", StopLossUSD, " TP=$", TargetProfitUSD,
+            " | Count:", CountPositions(POSITION_TYPE_BUY)+1, "/", MaxPositions);
 
       if(!trade.Buy(LotSize, _Symbol, ask, slPrice, tpPrice, "XAUUSD v5 Buy"))
          Print("ERROR: Buy failed. Code:", GetLastError());
    }
 
    // ================================================================
-   // SELL: crossover + H4 downtrend + RSI momentum confirmed
+   // SELL: bearish crossover + H4 downtrend + RSI not oversold
    // ================================================================
    else if(bearishCross && htfBearish && rsiOkSell &&
            CountPositions(POSITION_TYPE_SELL) < MaxPositions)
@@ -381,11 +389,8 @@ void OnTick()
       double slPrice = NormalizeDouble(bid + slDist, _Digits);
       double tpPrice = NormalizeDouble(bid - tpDist, _Digits);
 
-      Print("SELL | H4EMA=", DoubleToString(htfEMA, 2),
-            " Price<H4=YES | RSI=", DoubleToString(rsi, 1),
-            " | FastEMA=", DoubleToString(fastNow, 2),
-            " SlowEMA=", DoubleToString(slowNow, 2),
-            " | SL=$", StopLossUSD, " TP=$", TargetProfitUSD);
+      Print(">>> OPENING SELL | SL=$", StopLossUSD, " TP=$", TargetProfitUSD,
+            " | Count:", CountPositions(POSITION_TYPE_SELL)+1, "/", MaxPositions);
 
       if(!trade.Sell(LotSize, _Symbol, bid, slPrice, tpPrice, "XAUUSD v5 Sell"))
          Print("ERROR: Sell failed. Code:", GetLastError());
