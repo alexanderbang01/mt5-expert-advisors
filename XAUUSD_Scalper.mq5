@@ -11,7 +11,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Custom EA"
 #property link      ""
-#property version   "3.00"
+#property version   "4.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -38,6 +38,7 @@ input double ATR_MaxThreshold   = 3.0;  // Skip entry if ATR exceeds this (0 = d
 input int    CooldownSeconds    = 10;   // Seconds to wait after a close before new entry
 
 input group "=== EA Settings ==="
+input int    MaxPositions       = 2;     // Max simultaneous open positions (same direction)
 input long   MagicNumber        = 99999; // Unique ID for this EA's orders
 
 //+------------------------------------------------------------------+
@@ -190,27 +191,61 @@ bool IsCooldownOver()
 }
 
 //+------------------------------------------------------------------+
-//| FindPosition                                                      |
+//| ManageOpenPositions                                               |
 //|                                                                   |
-//| Searches for an open position belonging to this EA on this       |
-//| symbol. Returns true if found, and fills the out parameters.     |
+//| Loops through ALL positions for this EA and closes any that have |
+//| hit the USD profit or loss target. Runs on every tick so exits  |
+//| are as precise as possible regardless of how many are open.      |
 //+------------------------------------------------------------------+
-bool FindPosition(ulong &ticket, double &profit, ENUM_POSITION_TYPE &posType)
+void ManageOpenPositions()
 {
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
-      ulong t = PositionGetTicket(i);
-      if(t == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL)  == _Symbol    &&
-         PositionGetInteger(POSITION_MAGIC)  == MagicNumber)
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL)  != _Symbol)     continue;
+      if(PositionGetInteger(POSITION_MAGIC)  != MagicNumber) continue;
+
+      double profit = PositionGetDouble(POSITION_PROFIT);
+
+      if(profit >= TargetProfitUSD)
       {
-         ticket  = t;
-         profit  = PositionGetDouble(POSITION_PROFIT);
-         posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         return true;
+         Print("TP hit $", DoubleToString(profit, 2), " — closing #", ticket);
+         if(trade.PositionClose(ticket))
+            lastCloseTime = TimeCurrent();
+         else
+            Print("ERROR: Close failed #", ticket, " Code:", GetLastError());
+      }
+      else if(profit <= -StopLossUSD)
+      {
+         Print("SL hit $", DoubleToString(profit, 2), " — closing #", ticket);
+         if(trade.PositionClose(ticket))
+            lastCloseTime = TimeCurrent();
+         else
+            Print("ERROR: Close failed #", ticket, " Code:", GetLastError());
       }
    }
-   return false;
+}
+
+//+------------------------------------------------------------------+
+//| CountPositions                                                    |
+//|                                                                   |
+//| Returns how many positions of a given type (BUY/SELL) are        |
+//| currently open for this EA on this symbol.                       |
+//+------------------------------------------------------------------+
+int CountPositions(ENUM_POSITION_TYPE posType)
+{
+   int count = 0;
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL)  == _Symbol     &&
+         PositionGetInteger(POSITION_MAGIC)  == MagicNumber &&
+         PositionGetInteger(POSITION_TYPE)   == posType)
+         count++;
+   }
+   return count;
 }
 
 //+------------------------------------------------------------------+
@@ -233,48 +268,15 @@ bool IsNewBar()
 void OnTick()
 {
    // ================================================================
-   // PART 1: Manage any open position
-   // Check USD profit and loss on every tick and close if limits hit.
-   // The hard SL/TP on the order acts as a backup if the EA is offline.
+   // PART 1: Manage all open positions every tick
+   // Checks every open position and closes any that have hit their
+   // USD profit or loss target. Handles multiple positions correctly.
    // ================================================================
-   ulong              ticket  = 0;
-   double             profit  = 0;
-   ENUM_POSITION_TYPE posType;
-
-   if(FindPosition(ticket, profit, posType))
-   {
-      // Close if profit target reached
-      if(profit >= TargetProfitUSD)
-      {
-         Print("TP hit — Profit: $", DoubleToString(profit, 2),
-               " >= $", TargetProfitUSD, " | Closing #", ticket);
-         if(trade.PositionClose(ticket))
-            lastCloseTime = TimeCurrent();
-         else
-            Print("ERROR: Failed to close position #", ticket, " Code:", GetLastError());
-         return;
-      }
-
-      // Close if stop loss reached
-      if(profit <= -StopLossUSD)
-      {
-         Print("SL hit — Loss: $", DoubleToString(profit, 2),
-               " <= -$", StopLossUSD, " | Closing #", ticket);
-         if(trade.PositionClose(ticket))
-            lastCloseTime = TimeCurrent();
-         else
-            Print("ERROR: Failed to close position #", ticket, " Code:", GetLastError());
-         return;
-      }
-
-      // Position is within acceptable range — hold it
-      return;
-   }
+   ManageOpenPositions();
 
    // ================================================================
-   // PART 2: No position open — evaluate entry conditions
-   // Entry logic is gated to new bars only. TP/SL monitoring above
-   // still runs on every tick for precise exit timing.
+   // PART 2: Evaluate entry — gated to new bars only
+   // TP/SL monitoring above runs every tick; entries run once per bar.
    // ================================================================
    if(!IsNewBar()) return;
 
@@ -342,34 +344,34 @@ void OnTick()
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
    // --- BUY on bullish crossover ---
-   if(bullishCross)
+   if(bullishCross && CountPositions(POSITION_TYPE_BUY) < MaxPositions)
    {
       double slPrice = NormalizeDouble(ask - slDist, _Digits);
       double tpPrice = NormalizeDouble(ask + tpDist, _Digits);
 
-      Print("BUY CROSS | FastEMA=", DoubleToString(fastNow, 2),
+      Print("BUY CROSS | #", CountPositions(POSITION_TYPE_BUY)+1, "/", MaxPositions,
+            " FastEMA=", DoubleToString(fastNow, 2),
             " SlowEMA=", DoubleToString(slowNow, 2),
-            " | Lots=", LotSize,
             " Ask=", DoubleToString(ask, _Digits),
-            " SL=", DoubleToString(slPrice, _Digits), " ($", StopLossUSD, ")",
-            " TP=", DoubleToString(tpPrice, _Digits), " ($", TargetProfitUSD, ")");
+            " SL=", DoubleToString(slPrice, _Digits),
+            " TP=", DoubleToString(tpPrice, _Digits));
 
       if(!trade.Buy(LotSize, _Symbol, ask, slPrice, tpPrice, "XAUUSD Scalper"))
          Print("ERROR: Buy order failed. Code:", GetLastError());
    }
 
    // --- SELL on bearish crossover ---
-   else if(bearishCross)
+   else if(bearishCross && CountPositions(POSITION_TYPE_SELL) < MaxPositions)
    {
       double slPrice = NormalizeDouble(bid + slDist, _Digits);
       double tpPrice = NormalizeDouble(bid - tpDist, _Digits);
 
-      Print("SELL CROSS | FastEMA=", DoubleToString(fastNow, 2),
+      Print("SELL CROSS | #", CountPositions(POSITION_TYPE_SELL)+1, "/", MaxPositions,
+            " FastEMA=", DoubleToString(fastNow, 2),
             " SlowEMA=", DoubleToString(slowNow, 2),
-            " | Lots=", LotSize,
             " Bid=", DoubleToString(bid, _Digits),
-            " SL=", DoubleToString(slPrice, _Digits), " ($", StopLossUSD, ")",
-            " TP=", DoubleToString(tpPrice, _Digits), " ($", TargetProfitUSD, ")");
+            " SL=", DoubleToString(slPrice, _Digits),
+            " TP=", DoubleToString(tpPrice, _Digits));
 
       if(!trade.Sell(LotSize, _Symbol, bid, slPrice, tpPrice, "XAUUSD Scalper"))
          Print("ERROR: Sell order failed. Code:", GetLastError());
