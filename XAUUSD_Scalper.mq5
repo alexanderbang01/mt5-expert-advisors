@@ -11,7 +11,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Custom EA"
 #property link      ""
-#property version   "1.00"
+#property version   "2.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -25,8 +25,8 @@ input int    EMA_Slow_Period    = 30;    // Slow EMA period
 
 input group "=== Trade Settings ==="
 input double LotSize            = 0.01;  // Trade volume in lots
-input double TargetProfitUSD    = 1.00;  // Close trade when floating profit reaches this ($)
-input double StopLossUSD        = 2.00;  // Close trade when floating loss reaches this ($)
+input double TargetProfitUSD    = 3.00;  // Close trade when floating profit reaches this ($)
+input double StopLossUSD        = 1.50;  // Close trade when floating loss reaches this ($)
 
 input group "=== Filters ==="
 input int    MaxSpreadPoints    = 50;    // Max allowed spread in points (0 = disabled)
@@ -50,6 +50,7 @@ int      handleSlowEMA;
 int      handleATR;
 
 datetime lastCloseTime = 0; // Time the last trade was closed (for cooldown)
+datetime lastBarTime   = 0; // Time of the last processed bar (for new-bar gate)
 
 //+------------------------------------------------------------------+
 //| OnInit — runs once when EA starts                                 |
@@ -213,6 +214,20 @@ bool FindPosition(ulong &ticket, double &profit, ENUM_POSITION_TYPE &posType)
 }
 
 //+------------------------------------------------------------------+
+//| IsNewBar — true only on the first tick of each new candle        |
+//|                                                                   |
+//| Entry evaluation is gated to once per bar. This prevents the    |
+//| EA from opening hundreds of trades per day — without this gate,  |
+//| a tick-based EA on XAUUSD can fire thousands of times per day.  |
+//+------------------------------------------------------------------+
+bool IsNewBar()
+{
+   datetime t = iTime(_Symbol, PERIOD_CURRENT, 0);
+   if(t != lastBarTime) { lastBarTime = t; return true; }
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| OnTick — main logic, fires on every price update                 |
 //+------------------------------------------------------------------+
 void OnTick()
@@ -258,7 +273,10 @@ void OnTick()
 
    // ================================================================
    // PART 2: No position open — evaluate entry conditions
+   // Entry logic is gated to new bars only. TP/SL monitoring above
+   // still runs on every tick for precise exit timing.
    // ================================================================
+   if(!IsNewBar()) return;
 
    // Cooldown: wait CooldownSeconds after last close
    if(!IsCooldownOver()) return;
@@ -270,19 +288,19 @@ void OnTick()
    if(!IsVolatilityOK()) return;
 
    // ================================================================
-   // PART 3: Read current EMA values
+   // PART 3: Read EMA values from the last CLOSED bar (index 1)
    //
-   // We use index 0 (the current live bar) so the EMA reflects the
-   // latest price on every tick — appropriate for tick-based scalping.
+   // Now that entry runs once per bar, we use the completed bar's
+   // EMA — avoids acting on an incomplete candle's forming value.
    // ================================================================
    double fastBuf[1], slowBuf[1];
 
-   if(CopyBuffer(handleFastEMA, 0, 0, 1, fastBuf) < 1)
+   if(CopyBuffer(handleFastEMA, 0, 1, 1, fastBuf) < 1)
    {
       Print("WARNING: Could not read Fast EMA buffer");
       return;
    }
-   if(CopyBuffer(handleSlowEMA, 0, 0, 1, slowBuf) < 1)
+   if(CopyBuffer(handleSlowEMA, 0, 1, 1, slowBuf) < 1)
    {
       Print("WARNING: Could not read Slow EMA buffer");
       return;
