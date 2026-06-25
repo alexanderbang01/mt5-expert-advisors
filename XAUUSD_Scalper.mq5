@@ -11,7 +11,7 @@
 //+------------------------------------------------------------------+
 #property copyright "Custom EA"
 #property link      ""
-#property version   "2.00"
+#property version   "3.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -288,34 +288,45 @@ void OnTick()
    if(!IsVolatilityOK()) return;
 
    // ================================================================
-   // PART 3: Read EMA values from the last CLOSED bar (index 1)
+   // PART 3: Read EMA values from the last TWO closed bars
    //
-   // Now that entry runs once per bar, we use the completed bar's
-   // EMA — avoids acting on an incomplete candle's forming value.
+   // We need bar[1] (just closed) and bar[2] (one before that) to
+   // detect a CROSSOVER — the moment direction actually changes.
+   // This is the critical fix: previously the EA opened a trade on
+   // EVERY bar while Fast > Slow, producing 6000+ trades. Now it
+   // only opens when the crossover JUST happened (direction changed).
    // ================================================================
-   double fastBuf[1], slowBuf[1];
+   double fastBuf[2], slowBuf[2];
 
-   if(CopyBuffer(handleFastEMA, 0, 1, 1, fastBuf) < 1)
+   if(CopyBuffer(handleFastEMA, 0, 1, 2, fastBuf) < 2)
    {
       Print("WARNING: Could not read Fast EMA buffer");
       return;
    }
-   if(CopyBuffer(handleSlowEMA, 0, 1, 1, slowBuf) < 1)
+   if(CopyBuffer(handleSlowEMA, 0, 1, 2, slowBuf) < 2)
    {
       Print("WARNING: Could not read Slow EMA buffer");
       return;
    }
 
-   double fastEMA = fastBuf[0];
-   double slowEMA = slowBuf[0];
+   // [0] = bar just closed, [1] = bar before that
+   double fastNow  = fastBuf[0];
+   double slowNow  = slowBuf[0];
+   double fastPrev = fastBuf[1];
+   double slowPrev = slowBuf[1];
 
    // ================================================================
-   // PART 4: Determine trend and open trade
+   // PART 4: Detect fresh crossover and open trade
+   //
+   // A crossover is when the relationship FLIPS between bars.
+   // Fast crossed ABOVE slow = bullish momentum just started → BUY
+   // Fast crossed BELOW slow = bearish momentum just started → SELL
+   // No crossover this bar = do nothing, wait for next signal.
    // ================================================================
-   bool isBullish = (fastEMA > slowEMA); // uptrend → buy only
-   bool isBearish = (fastEMA < slowEMA); // downtrend → sell only
+   bool bullishCross = (fastPrev <= slowPrev) && (fastNow > slowNow);
+   bool bearishCross = (fastPrev >= slowPrev) && (fastNow < slowNow);
 
-   if(!isBullish && !isBearish) return; // EMAs exactly equal — no clear trend
+   if(!bullishCross && !bearishCross) return;
 
    // Pre-calculate SL and TP price distances from USD amounts
    double slDist = CalcUSDtoPrice(StopLossUSD);
@@ -330,14 +341,14 @@ void OnTick()
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // --- BUY ---
-   if(isBullish)
+   // --- BUY on bullish crossover ---
+   if(bullishCross)
    {
       double slPrice = NormalizeDouble(ask - slDist, _Digits);
       double tpPrice = NormalizeDouble(ask + tpDist, _Digits);
 
-      Print("BUY  | FastEMA=", DoubleToString(fastEMA, 2),
-            " SlowEMA=", DoubleToString(slowEMA, 2),
+      Print("BUY CROSS | FastEMA=", DoubleToString(fastNow, 2),
+            " SlowEMA=", DoubleToString(slowNow, 2),
             " | Lots=", LotSize,
             " Ask=", DoubleToString(ask, _Digits),
             " SL=", DoubleToString(slPrice, _Digits), " ($", StopLossUSD, ")",
@@ -347,14 +358,14 @@ void OnTick()
          Print("ERROR: Buy order failed. Code:", GetLastError());
    }
 
-   // --- SELL ---
-   else if(isBearish)
+   // --- SELL on bearish crossover ---
+   else if(bearishCross)
    {
       double slPrice = NormalizeDouble(bid + slDist, _Digits);
       double tpPrice = NormalizeDouble(bid - tpDist, _Digits);
 
-      Print("SELL | FastEMA=", DoubleToString(fastEMA, 2),
-            " SlowEMA=", DoubleToString(slowEMA, 2),
+      Print("SELL CROSS | FastEMA=", DoubleToString(fastNow, 2),
+            " SlowEMA=", DoubleToString(slowNow, 2),
             " | Lots=", LotSize,
             " Bid=", DoubleToString(bid, _Digits),
             " SL=", DoubleToString(slPrice, _Digits), " ($", StopLossUSD, ")",
